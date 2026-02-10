@@ -1,0 +1,768 @@
+import os
+import random
+from datetime import datetime, timedelta
+from io import BytesIO
+from flask import Flask, render_template, request, redirect, url_for, session, flash, send_file, jsonify 
+from werkzeug.utils import secure_filename
+from werkzeug.security import generate_password_hash, check_password_hash
+from fpdf import FPDF
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import smtplib
+from db_config import get_connection
+import google.generativeai as genai
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+app = Flask(__name__)
+app.secret_key = "your_secret_key"
+
+UPLOAD_FOLDER = os.path.join("static", "uploads")
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg"}
+
+SMTP_EMAIL = "nishwalnishu0@gmail.com"
+SMTP_PASSWORD = "buet emon ueoy rxyw"
+
+# --- Gemini Configuration ---
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyA4IHAmtyzWg0RwjBzOPN6Y71p0ladtFLo") 
+
+SYSTEM_INSTRUCTION = """
+You are the Gemini Health Assistant for a retina health application. 
+Your goal is to provide general, helpful, and reassuring health information based on user questions.
+Your answers should specifically focus on **Cardiovascular Risk** and **Diabetic Retinopathy**, and general eye and wellness.
+**IMPORTANT:** Reply in the same language as the user's query.
+You must always include the disclaimer: "**I am not a doctor. Always consult a healthcare professional for medical advice, diagnosis, and treatment.**"
+Keep your answers clear, concise, and focused on general health, specifically in the context of retina health and well-being.
+"""
+
+model = None
+try:
+    genai.configure(api_key=GEMINI_API_KEY)
+    # Configure model with system instruction during initialization
+    model = genai.GenerativeModel(
+        "gemini-2.5-flash",  # FIX: Updated to the current stable flash model (was gemini-1.5-flash)
+        system_instruction=SYSTEM_INSTRUCTION
+    )
+    print("✅ Gemini AI configured successfully")
+except Exception as e:
+    print(f"❌ Gemini Configuration Error: {e}")
+    model = None
+
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+def allowed_file(filename):
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def send_email(to_email, subject, body):
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = SMTP_EMAIL
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain"))
+        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server.starttls()
+        server.login(SMTP_EMAIL, SMTP_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        print("✅ Email sent to:", to_email)
+    except Exception as e:
+        print("❌ Email sending error:", e)
+
+# --- Fixed Gemini Helper Function ---
+def get_gemini_response(prompt):
+    """
+    Get a response from Gemini AI model with proper error handling
+    """
+    global model
+    
+    if model is None:
+        return "❌ AI service is currently unavailable. Please try again later."
+    
+    if not prompt or not prompt.strip():
+        return "Please provide a valid question or message."
+    
+    try:
+        # Generate response with correct parameter name and optimized settings
+        response = model.generate_content(
+            contents=prompt,  # Correct parameter name
+            generation_config={
+                "temperature": 0.7,
+                "max_output_tokens": 512,  # Increased for better responses
+                "top_p": 0.95,
+                "top_k": 40
+            },
+            request_options={"timeout": 30}  # 30 second timeout
+        )
+        
+        # Extract text from response
+        if response and response.text:
+            return response.text
+        else:
+            return "I couldn't generate a proper response. Please try rephrasing your question."
+            
+    except Exception as e:
+        error_msg = str(e)
+        print(f"❌ Gemini API Error: {error_msg}")
+        
+        # Provide user-friendly error messages
+        if "timeout" in error_msg.lower():
+            return "⏱️ The request took too long. Please try asking a simpler question."
+        elif "quota" in error_msg.lower() or "rate" in error_msg.lower():
+            return "⚠️ Service is busy right now. Please try again in a moment."
+        elif "api" in error_msg.lower() or "key" in error_msg.lower():
+            return "🔒 API configuration issue. Please contact support."
+        else:
+            return "❌ An error occurred. Please try again or rephrase your question."
+
+# ============================================================
+# MOCK PREDICTION FUNCTIONS
+# ============================================================
+def predict_dr(image_path):
+    result = random.choice(["Non-Diabetic", "Diabetic"])
+    conf = round(random.uniform(0.75, 0.99), 2)
+    return result, conf
+
+def predict_cvd():
+    result = random.choice(["No Heart Disease", "Heart Disease"])
+    conf = round(random.uniform(0.75, 0.99), 2)
+    return result, conf
+
+# ============================================================
+# PDF GENERATION
+# ============================================================
+def generate_pdf(report, doctor=None, appointment=None):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", "B", 16)
+    pdf.cell(200, 10, txt="Retina Health Report", ln=True, align="C")
+    pdf.ln(10)
+    pdf.set_font("Arial", size=12)
+    for k, v in report.items():
+        pdf.cell(200, 10, txt=f"{k}: {v}", ln=True)
+    if doctor:
+        pdf.ln(5)
+        pdf.cell(200, 10, txt=f"Doctor: {doctor['name']} ({doctor['email']})", ln=True)
+    if appointment:
+        pdf.cell(200, 10, txt=f"Appointment: {appointment['appointment_time']} | Status: {appointment['status']}", ln=True)
+    pdf_bytes = pdf.output(dest='S').encode('latin1')
+    return BytesIO(pdf_bytes)
+
+def generate_prescription_pdf(prescription_data):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", "B", 18)
+    pdf.cell(200, 10, txt="Medical Prescription", ln=True, align="C")
+    pdf.ln(10)
+    pdf.set_font("Arial", size=12)
+    pdf.cell(200, 10, txt=f"Date: {prescription_data['date_prescribed']}", ln=True)
+    pdf.cell(200, 10, txt=f"Patient: {prescription_data['patient_name']} (ID: {prescription_data['patient_id']})", ln=True)
+    pdf.cell(200, 10, txt=f"Doctor: Dr. {prescription_data['doctor_name']} ({prescription_data['specialization']})", ln=True)
+    pdf.ln(10)
+    pdf.set_font("Arial", "B", 14)
+    pdf.cell(200, 10, txt="Medication Details:", ln=True)
+    pdf.set_font("Arial", size=12)
+    pdf.cell(200, 7, txt=f"Medicine: {prescription_data['medication_name']}", ln=True)
+    pdf.cell(200, 7, txt=f"Dosage: {prescription_data['dosage']}", ln=True)
+    pdf.cell(200, 7, txt=f"Instructions: {prescription_data['instructions']}", ln=True)
+    pdf_bytes = pdf.output(dest='S').encode('latin1')
+    return BytesIO(pdf_bytes)
+
+# ============================================================
+# ROUTES 
+# ============================================================
+
+@app.route("/")
+def home():
+    return render_template("index.html")
+
+# ---------------- CORE PAGES ----------------
+@app.route("/about")
+def about():
+    return render_template("about.html")
+
+@app.route("/contact", methods=["GET", "POST"])
+def contact():
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        email = request.form.get("email", "").strip()
+        phone = request.form.get("phone", "").strip()
+        subject = request.form.get("subject", "").strip()
+        message = request.form.get("message", "").strip()
+        
+        # Validation
+        if not all([name, email, subject, message]):
+            flash("Please fill in all required fields.", "danger")
+            return redirect(url_for("contact"))
+        
+        # Send email notification
+        try:
+            admin_body = f"""New Contact Form Submission:
+
+Name: {name}
+Email: {email}
+Phone: {phone if phone else 'Not provided'}
+Subject: {subject}
+
+Message:
+{message}
+
+---
+Sent from RetinaAI Contact Form
+"""
+            # Send to admin
+            send_email(SMTP_EMAIL, f"Contact Form: {subject}", admin_body)
+            
+            # Send confirmation to user
+            user_body = f"""Dear {name},
+
+Thank you for contacting RetinaAI! We have received your message regarding: "{subject}"
+
+We will review your inquiry and respond within 24 hours.
+
+Your message:
+{message}
+
+Best regards,
+RetinaAI Team
+
+---
+This is an automated confirmation email. Please do not reply directly to this message.
+"""
+            send_email(email, "Contact Confirmation - RetinaAI", user_body)
+            
+            flash("Thank you for contacting us! We will get back to you within 24 hours.", "success")
+        except Exception as e:
+            print(f"Contact form error: {e}")
+            flash("Message received! We'll respond soon.", "success")
+            
+        return redirect(url_for("contact"))
+    
+    return render_template("contact.html")
+
+# ---------------- PATIENT REGISTER ----------------
+@app.route("/patient/register", methods=["GET", "POST"])
+def patient_register():
+    if request.method == "POST":
+        name = request.form["name"]
+        email = request.form["email"]
+        password = generate_password_hash(request.form["password"])
+        age = request.form.get("age")
+        gender = request.form.get("gender")
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO patients (name,email,password,age,gender) VALUES (%s,%s,%s,%s,%s)",
+                    (name, email, password, age, gender))
+        conn.commit()
+        cur.close()
+        conn.close()
+        flash("Registration successful! Please login.", "success")
+        return redirect(url_for("patient_login"))
+    return render_template("patient_register.html")
+
+# ---------------- PATIENT LOGIN ----------------
+@app.route("/patient/login", methods=["GET", "POST"])
+def patient_login():
+    if request.method == "POST":
+        email = request.form["email"]
+        password = request.form["password"]
+        conn = get_connection()
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT * FROM patients WHERE email=%s", (email,))
+        patient = cur.fetchone()
+        cur.close()
+        conn.close()
+        if patient and check_password_hash(patient["password"], password):
+            session["patient_id"] = patient["patient_id"]
+            session["patient_name"] = patient["name"]
+            session["patient_email"] = patient["email"]
+            return redirect(url_for("patient_dashboard"))
+        flash("Invalid credentials", "danger")
+    return render_template("patient_login.html")
+
+# ---------------- PATIENT DASHBOARD ----------------
+@app.route("/patient/dashboard", methods=["GET", "POST"])
+def patient_dashboard():
+    if "patient_id" not in session:
+        return redirect(url_for("patient_login"))
+
+    dr_result = cvd_result = dr_conf = cvd_conf = uploaded_file = None
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+
+    # Handle Retina & CVD Prediction
+    if request.method == "POST" and "retina_image" in request.files:
+        file = request.files["retina_image"]
+        if file and allowed_file(file.filename):
+            filename = secure_filename(file.filename)
+            path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+            file.save(path)
+            uploaded_file = filename
+
+            dr_result, dr_conf = predict_dr(path)
+            cvd_result, cvd_conf = predict_cvd()
+
+            cur.execute("INSERT INTO reports (patient_id, dr_result, cvd_result, image_path) VALUES (%s,%s,%s,%s)",
+                        (session["patient_id"], dr_result, cvd_result, path))
+            conn.commit()
+
+            # CRITICAL ALERT EMAIL LOGIC to PATIENT
+            if dr_result == "Diabetic" or cvd_result == "Heart Disease":
+                patient_email = session.get("patient_email")
+                if patient_email:
+                    critical_findings = []
+                    if dr_result == "Diabetic": critical_findings.append("Diabetic Retinopathy")
+                    if cvd_result == "Heart Disease": critical_findings.append("Cardiovascular Risk")
+                    
+                    send_email(
+                        patient_email,
+                        "CRITICAL HEALTH ALERT: Urgent Review Required",
+                        f"Dear {session['patient_name']}, your recent health report shows CRITICAL findings: {', '.join(critical_findings)}.\n\nWe strongly recommend you book an appointment with a specialist as soon as possible for a professional consultation."
+                    )
+                    flash("Prediction complete. CRITICAL results detected, an alert has been sent to your email.", "danger")
+                else:
+                    flash("Prediction complete. CRITICAL results detected. Please view your report.", "danger")
+            else:
+                flash("Prediction complete. Results show no immediate critical findings.", "success")
+
+    # Fetch doctors for appointment selection
+    cur.execute("SELECT doctor_id, name, specialization FROM doctors")
+    doctors = cur.fetchall()
+
+    # Fetch patient appointments
+    cur.execute("""SELECT a.appointment_id, a.appointment_time, a.status, d.name AS doctor_name, d.email AS doctor_email
+                   FROM appointments a
+                   JOIN doctors d ON a.doctor_id=d.doctor_id
+                   WHERE a.patient_id=%s
+                   ORDER BY a.appointment_time DESC""", (session["patient_id"],))
+    appointments = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    return render_template("dashboard_patient.html",
+                           dr_result=dr_result, dr_conf=dr_conf,
+                           cvd_result=cvd_result, cvd_conf=cvd_conf,
+                           uploaded_file=uploaded_file,
+                           doctors=doctors, appointments=appointments)
+
+# ---------------- MANUAL APPOINTMENT BOOKING ----------------
+@app.route("/patient/book_appointment", methods=["POST"])
+def patient_book_appointment():
+    if "patient_id" not in session:
+        return redirect(url_for("patient_login"))
+    
+    doctor_id = request.form.get("doctor_id")
+    appointment_time_str = request.form.get("appointment_time")
+
+    if not doctor_id or not appointment_time_str:
+        flash("Please select a doctor and a valid time.", "danger")
+        return redirect(url_for("patient_dashboard"))
+
+    try:
+        appointment_time = datetime.strptime(appointment_time_str, "%Y-%m-%dT%H:%M")
+    except ValueError:
+        flash("Invalid date and time format.", "danger")
+        return redirect(url_for("patient_dashboard"))
+
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+
+    # Insert new appointment with default 'Pending' status
+    cur.execute("INSERT INTO appointments (patient_id, doctor_id, appointment_time, status) VALUES (%s, %s, %s, %s)",
+                (session["patient_id"], doctor_id, appointment_time, "Pending"))
+    conn.commit()
+
+    # Fetch doctor email for notification
+    cur.execute("SELECT email FROM doctors WHERE doctor_id=%s", (doctor_id,))
+    doctor = cur.fetchone()
+    conn.close()
+    
+    if doctor:
+        send_email(
+            doctor["email"],
+            "New Appointment Request",
+            f"Patient {session['patient_name']} has requested an appointment on {appointment_time}. Please login to your dashboard to confirm."
+        )
+
+    flash("Appointment request submitted successfully. It is currently pending doctor confirmation.", "success")
+    return redirect(url_for("patient_dashboard"))
+
+# ---------------- PATIENT APPOINTMENTS ----------------
+@app.route("/patient/appointments")
+def patient_appointments():
+    if "patient_id" not in session:
+        return redirect(url_for("patient_login"))
+
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""SELECT a.appointment_id, a.appointment_time, a.status, d.name AS doctor_name, d.email AS doctor_email
+                   FROM appointments a
+                   JOIN doctors d ON a.doctor_id=d.doctor_id
+                   WHERE a.patient_id=%s
+                   ORDER BY a.appointment_time DESC""", (session["patient_id"],))
+    appointments = cur.fetchall()
+    cur.close()
+    conn.close()
+    return render_template("patient_appointments.html", appointments=appointments)
+
+# ---------------- PATIENT PROFILE ----------------
+@app.route("/patient/profile", methods=["GET", "POST"])
+def patient_profile():
+    if "patient_id" not in session:
+        return redirect(url_for("patient_login"))
+
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+    
+    if request.method == "POST":
+        # Assumes your patient table has these fields
+        age = request.form.get("age")
+        gender = request.form.get("gender")
+        phone_number = request.form.get("phone_number")
+        address = request.form.get("address")
+        blood_group = request.form.get("blood_group")
+
+        cur.execute("""UPDATE patients SET age=%s, gender=%s, phone_number=%s, address=%s, blood_group=%s
+                       WHERE patient_id=%s""",
+                    (age, gender, phone_number, address, blood_group, session["patient_id"]))
+        conn.commit()
+        flash("Profile updated successfully.", "success")
+        # Note: We continue to fetch data below instead of redirecting on POST
+    
+    # Fetch current patient data
+    cur.execute("SELECT * FROM patients WHERE patient_id=%s", (session["patient_id"],))
+    patient_data = cur.fetchone()
+
+    # --- NEW: Fetch patient's prescription history ---
+    cur.execute("""
+        SELECT pr.prescription_id, pr.medication_name, pr.dosage, pr.date_prescribed,
+               d.name AS doctor_name, d.specialization
+        FROM prescriptions pr
+        JOIN appointments a ON pr.appointment_id = a.appointment_id
+        JOIN doctors d ON pr.doctor_id = d.doctor_id
+        WHERE a.patient_id=%s
+        ORDER BY pr.date_prescribed DESC
+    """, (session["patient_id"],))
+    prescription_history = cur.fetchall()
+    # --------------------------------------------------
+
+    cur.close()
+    conn.close()
+    
+    # Pass prescription_history to the template
+    return render_template("patient_profile.html", patient=patient_data, prescriptions=prescription_history)
+
+# ---------------- PATIENT CHATBOT ----------------
+@app.route("/chatbot", methods=["GET", "POST"])
+def chatbot():
+    if "patient_id" not in session:
+        if request.method == "POST":
+            return jsonify({"response": "Error: Not logged in. Please log in again."}), 401
+        flash("Please login first", "error")
+        return redirect(url_for("patient_login"))
+    
+    # Handle AJAX POST request from chatbot.html
+    if request.method == "POST":
+        user_prompt = request.form.get("user_input")
+        
+        if not user_prompt or not user_prompt.strip():
+            return jsonify({"response": "Please enter a message."}), 400
+
+        try:
+            # Call the fixed Gemini response function
+            response_text = get_gemini_response(user_prompt)
+            return jsonify({"response": response_text})
+        except Exception as e:
+            print(f"❌ Chatbot Error: {str(e)}")
+            return jsonify({"response": "An unexpected error occurred. Please try again."}), 500
+
+    # Handle initial GET request to load the page
+    return render_template("chatbot.html", chat_history=[])
+
+# ---------------- CHATBOT VOICE INPUT ENDPOINT ----------------
+@app.route("/chatbot_audio_input", methods=["POST"])
+def chatbot_audio_input():
+    if "patient_id" not in session:
+        return jsonify({"response": "Error: Not logged in. Please log in again."}), 401
+
+    transcript = request.form.get("audio_transcript")
+    
+    if not transcript or not transcript.strip():
+        return jsonify({"response": "No voice command received. Please speak clearly."}), 400
+
+    try:
+        # Reuse the existing Gemini response function
+        response_text = get_gemini_response(transcript)
+        return jsonify({"response": response_text})
+    except Exception as e:
+        print(f"❌ Chatbot Voice Error: {str(e)}")
+        return jsonify({"response": "An error occurred while processing your voice command."}), 500
+
+# ---------------- DOCTOR REGISTER ----------------
+@app.route("/doctor/register", methods=["GET", "POST"])
+def doctor_register():
+    if request.method == "POST":
+        name = request.form["name"]
+        email = request.form["email"]
+        password = generate_password_hash(request.form["password"])
+        specialization = request.form.get("specialization", "General")
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO doctors (name,email,password,specialization) VALUES (%s,%s,%s,%s)",
+                    (name, email, password, specialization))
+        conn.commit()
+        cur.close()
+        conn.close()
+        flash("Doctor registered successfully! Please login.", "success")
+        return redirect(url_for("doctor_login"))
+    return render_template("doctor_register.html")
+
+# ---------------- DOCTOR LOGIN ----------------
+@app.route("/doctor/login", methods=["GET", "POST"])
+def doctor_login():
+    if request.method == "POST":
+        email = request.form["email"]
+        password = request.form["password"]
+        conn = get_connection()
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT * FROM doctors WHERE email=%s", (email,))
+        doctor = cur.fetchone()
+        cur.close()
+        conn.close()
+        if doctor and check_password_hash(doctor["password"], password):
+            session["doctor_id"] = doctor["doctor_id"]
+            session["doctor_name"] = doctor["name"]
+            session["doctor_email"] = doctor["email"]
+            return redirect(url_for("doctor_dashboard"))
+        flash("Invalid credentials.", "danger")
+    return render_template("doctor_login.html")
+
+# ---------------- DOCTOR PROFILE ----------------
+@app.route("/doctor/profile", methods=["GET", "POST"])
+def doctor_profile():
+    if "doctor_id" not in session:
+        return redirect(url_for("doctor_login"))
+
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+    
+    if request.method == "POST":
+        specialization = request.form.get("specialization")
+        cur.execute("UPDATE doctors SET specialization=%s WHERE doctor_id=%s",
+                    (specialization, session["doctor_id"]))
+        conn.commit()
+        flash("Profile updated successfully.", "success")
+        return redirect(url_for("doctor_profile"))
+
+    # Fetch current doctor data
+    cur.execute("SELECT * FROM doctors WHERE doctor_id=%s", (session["doctor_id"],))
+    doctor_data = cur.fetchone()
+    cur.close()
+    conn.close()
+    return render_template("doctor_profile.html", doctor=doctor_data)
+
+# ---------------- DOCTOR DASHBOARD ----------------
+@app.route("/doctor/dashboard")
+def doctor_dashboard():
+    if "doctor_id" not in session:
+        return redirect(url_for("doctor_login"))
+
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+
+    # Appointments
+    cur.execute("""
+        SELECT a.appointment_id, a.appointment_time, a.status,
+                p.name AS patient_name, p.email AS patient_email
+        FROM appointments a
+        JOIN patients p ON a.patient_id=p.patient_id
+        WHERE a.doctor_id=%s
+        ORDER BY a.appointment_time
+    """, (session["doctor_id"],))
+    appointments = cur.fetchall()
+
+    # Patient reports linked to doctor's appointments
+    cur.execute("""
+        SELECT r.report_id, r.patient_id, r.dr_result, r.cvd_result, r.image_path, 
+                p.name AS patient_name, p.email AS patient_email, p.age, p.gender,
+                a.appointment_id
+        FROM reports r
+        JOIN patients p ON r.patient_id=p.patient_id
+        JOIN appointments a ON a.patient_id=r.patient_id AND a.doctor_id=%s
+        ORDER BY r.report_id DESC
+    """, (session["doctor_id"],))
+    patient_reports = cur.fetchall()
+
+    for rep in patient_reports:
+        if rep["image_path"]:
+            rep["image_filename"] = os.path.basename(rep["image_path"])
+
+    cur.close()
+    conn.close()
+
+    return render_template("dashboard_doctor.html", appointments=appointments, patient_reports=patient_reports)
+
+# ---------------- ACCEPT APPOINTMENT ----------------
+@app.route("/doctor/accept/<int:appointment_id>")
+def accept_appointment(appointment_id):
+    if "doctor_id" not in session:
+        return redirect(url_for("doctor_login"))
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("UPDATE appointments SET status='Confirmed' WHERE appointment_id=%s", (appointment_id,))
+    conn.commit()
+
+    # Fetch patient email and details
+    cur.execute("""SELECT p.email, p.name, a.appointment_time
+                   FROM appointments a
+                   JOIN patients p ON a.patient_id=p.patient_id
+                   WHERE a.appointment_id=%s""", (appointment_id,))
+    patient = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    # Email notification
+    send_email(
+        patient["email"],
+        "Appointment Confirmed",
+        f"Dear {patient['name']}, your appointment on {patient['appointment_time']} has been confirmed by the doctor."
+    )
+    flash("Appointment confirmed and patient notified.", "success")
+    return redirect(url_for("doctor_dashboard"))
+
+# ---------------- PRESCRIPTION MODULE (DOCTOR) ----------------
+@app.route("/doctor/prescribe/<int:appointment_id>", methods=["GET", "POST"])
+def doctor_prescribe(appointment_id):
+    if "doctor_id" not in session:
+        return redirect(url_for("doctor_login"))
+
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+
+    # 1. Fetch appointment and patient details
+    cur.execute("""
+        SELECT a.appointment_id, p.patient_id, p.name AS patient_name, p.email AS patient_email
+        FROM appointments a
+        JOIN patients p ON a.patient_id = p.patient_id
+        WHERE a.appointment_id=%s AND a.doctor_id=%s
+    """, (appointment_id, session["doctor_id"]))
+    appointment_data = cur.fetchone()
+
+    if not appointment_data:
+        cur.close()
+        conn.close()
+        flash("Appointment not found or not assigned to you.", "danger")
+        return redirect(url_for("doctor_dashboard"))
+
+    if request.method == "POST":
+        medication_name = request.form.get("medication_name")
+        dosage = request.form.get("dosage")
+        instructions = request.form.get("instructions")
+        
+        # 2. Insert prescription record
+        cur.execute("""
+            INSERT INTO prescriptions (appointment_id, doctor_id, medication_name, dosage, instructions, date_prescribed)
+            VALUES (%s, %s, %s, %s, %s, NOW())
+        """, (appointment_id, session["doctor_id"], medication_name, dosage, instructions))
+        conn.commit()
+        
+        # 3. Fetch the newly created prescription ID (not strictly needed but good practice)
+        # prescription_id = cur.lastrowid
+        
+        cur.close()
+        conn.close()
+        flash(f"Prescription for {medication_name} created successfully.", "success")
+        
+        return redirect(url_for('doctor_dashboard'))
+
+    # Fetch existing prescriptions for this appointment
+    cur.execute("SELECT * FROM prescriptions WHERE appointment_id=%s", (appointment_id,))
+    prescriptions = cur.fetchall()
+
+    cur.close()
+    conn.close()
+    return render_template("doctor_prescribe.html", appointment=appointment_data, prescriptions=prescriptions)
+
+# ---------------- DOWNLOAD PRESCRIPTION ----------------
+@app.route("/download_prescription/<int:prescription_id>")
+def download_prescription(prescription_id):
+    if "doctor_id" not in session and "patient_id" not in session:
+        return redirect(url_for("home"))
+    
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+    
+    # Fetch all data required for the PDF
+    cur.execute("""
+        SELECT pr.*, p.name AS patient_name, p.patient_id,
+                d.name AS doctor_name, d.specialization
+        FROM prescriptions pr
+        JOIN appointments a ON pr.appointment_id = a.appointment_id
+        JOIN patients p ON a.patient_id = p.patient_id
+        JOIN doctors d ON a.doctor_id = d.doctor_id
+        WHERE pr.prescription_id=%s
+    """, (prescription_id,))
+    data = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    if not data:
+        flash("Prescription not found!", "danger")
+        return redirect(request.referrer or url_for("patient_profile")) # Fallback to patient profile
+
+    # Convert date to string for PDF
+    data["date_prescribed"] = data["date_prescribed"].strftime("%Y-%m-%d")
+
+    pdf = generate_prescription_pdf(data)
+    return send_file(pdf, download_name=f"prescription_{prescription_id}.pdf", as_attachment=True)
+
+# ---------------- DOWNLOAD REPORT ----------------
+@app.route("/download_report/<int:appointment_id>")
+def download_report(appointment_id):
+    if "doctor_id" not in session and "patient_id" not in session:
+        return redirect(url_for("home"))
+
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT r.*, p.name AS patient_name, p.email AS patient_email, a.appointment_time, a.status,
+                d.name AS doctor_name, d.email AS doctor_email
+        FROM reports r
+        JOIN patients p ON r.patient_id=p.patient_id
+        JOIN appointments a ON a.patient_id=r.patient_id
+        JOIN doctors d ON a.doctor_id=d.doctor_id
+        WHERE a.appointment_id=%s
+    """, (appointment_id,))
+    data = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    if not data:
+        flash("Report not found!", "danger")
+        return redirect(request.referrer or url_for("home"))
+
+    report_data = {
+        "Diabetic Retinopathy": data["dr_result"],
+        "Cardiovascular Risk": data["cvd_result"]
+    }
+    pdf = generate_pdf(report_data, doctor={"name": data["doctor_name"], "email": data["doctor_email"]},
+                       appointment={"appointment_time": data["appointment_time"], "status": data["status"]})
+    return send_file(pdf, download_name="retina_report.pdf", as_attachment=True)
+
+# ---------------- LOGOUT ----------------
+@app.route("/logout")
+def logout():
+    session.clear()
+    flash("You have been logged out successfully.", "info")
+    return redirect(url_for("home"))
+
+# ============================================================
+# RUN APP
+# ============================================================
+if __name__ == "__main__":
+    app.run(debug=True)
